@@ -1,25 +1,15 @@
 import numpy as np
 import pandas as pd
+import xgboost as xgb
+import tensorflow as tf
 
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_absolute_error
-try:
-    # sklearn>=1.4
-    from sklearn.metrics import root_mean_squared_error
-except Exception:
-    root_mean_squared_error = None
-    from sklearn.metrics import mean_squared_error
-
-import tensorflow as tf
+from sklearn.linear_model import Ridge
+from sklearn.metrics import root_mean_squared_error
+from sklearn.metrics import mean_squared_error
 from tensorflow import keras
 from tensorflow.keras import layers
-
-# Optional for XGB
-try:
-    import xgboost as xgb
-except Exception:
-    xgb = None
-    print("[WARN] xgboost not installed. XGB stage will be skipped. pip install xgboost")
 
 
 # =========================
@@ -35,7 +25,9 @@ TIME_COL   = "open_time"
 
 # label selection / creation
 PREFERRED_LABELS = ["label", "label_SM_minmax", "future_ret", "ret_fwd_1bar"]
-LABEL_HORIZON_BARS = 12   # if label not found, create log return over next N bars
+
+# ---- CHANGED: make horizon a LIST for grid search ----
+LABEL_HORIZON_LIST = [288, 576, 1440, 2880, 4000]  # example spans, edit as you like
 
 # train/val/test split ratios (chronological)
 TRAIN_FRAC = 0.70
@@ -70,6 +62,9 @@ XGB_PARAMS = dict(
 )
 XGB_EARLY_STOP = 50
 XGB_EVAL_METRIC = "rmse"
+
+# stacking stability
+STACK_RIDGE_ALPHA = 1.0
 # =========================
 
 
@@ -119,27 +114,29 @@ def build_mlp(input_dim, hidden=(64, 32), dropout=0.2, lr=1e-3):
     return model
 
 
-def pick_or_create_label(df: pd.DataFrame):
+# ---- MIN CHANGE: add optional force_create so grid search always uses horizon label ----
+def pick_or_create_label(df: pd.DataFrame, label_horizon_bars: int, force_create: bool = True):
     label_col = None
-    for c in PREFERRED_LABELS:
-        if c in df.columns:
-            label_col = c
-            break
+
+    if not force_create:
+        for c in PREFERRED_LABELS:
+            if c in df.columns:
+                label_col = c
+                break
 
     if label_col is None:
-        # forward log return over next LABEL_HORIZON_BARS bars
-        # y_t = log(close_{t+H}/close_t)
-        h = int(LABEL_HORIZON_BARS)
-        df["ret_fwd"] = np.log(df["close"].shift(-h) / df["close"])
-        label_col = "ret_fwd"
+        h = int(label_horizon_bars)
+        col_name = f"ret_fwd_{h}"
+        df[col_name] = np.log(df["close"].shift(-h) / df["close"])
+        label_col = col_name
         print(f"[INFO] Created label '{label_col}' with horizon {h} bars.")
     else:
         print(f"[INFO] Using existing label '{label_col}'.")
 
     # drop last H rows where label is NaN after shift(-h)
-    h = int(LABEL_HORIZON_BARS) if label_col == "ret_fwd" else 0
+    h = int(label_horizon_bars) if label_col.startswith("ret_fwd_") else 0
     if h > 0:
-        df = df.iloc[:-h].copy()
+        df = df.iloc[:-h].copy().reset_index(drop=True)
 
     return df, label_col
 
@@ -180,19 +177,138 @@ def eval_regression(y_true, y_pred, name="Model"):
     else:
         rmse = mean_squared_error(y_true, y_pred, squared=False)
     mae  = mean_absolute_error(y_true, y_pred)
-    corr = np.corrcoef(y_pred, y_true)[0, 1] if len(y_true) > 2 else np.nan
+
+    if len(y_true) > 2 and np.std(y_pred) > 0 and np.std(y_true) > 0:
+        corr = np.corrcoef(y_pred, y_true)[0, 1]
+    else:
+        corr = np.nan
+
     print(f"[{name}] RMSE={rmse:.6f}, MAE={mae:.6f}, Corr={corr:.6f}")
     return rmse, mae, corr
 
 
-def main():
+def learn_simplex_weights(pred_mlp_val, pred_xgb_val, y_val, alpha=1.0):
+    A = np.vstack([pred_mlp_val, pred_xgb_val]).T
+    stacker = Ridge(alpha=alpha, fit_intercept=True, random_state=SEED)
+    stacker.fit(A, y_val)
+    w = stacker.coef_.astype(np.float64)
+
+    w = np.clip(w, 0.0, None)
+    s = w.sum()
+    if not np.isfinite(s) or s <= 1e-12:
+        w = np.array([0.5, 0.5], dtype=np.float64)
+    else:
+        w = w / s
+    return w
+
+
+def overall_ic(df, label_col, pred_col):
+    d = df[[label_col, pred_col]].dropna()
+    ic_p = d[pred_col].corr(d[label_col], method="pearson")
+    ic_s = d[pred_col].corr(d[label_col], method="spearman")
+    return ic_p, ic_s
+
+
+def rolling_ic(df, label_col, pred_col, window=288):
+    d = df[[label_col, pred_col]].dropna()
+    roll_p = d[pred_col].rolling(window).corr(d[label_col])
+    pred_rank  = d[pred_col].rank()
+    label_rank = d[label_col].rank()
+    roll_s = pred_rank.rolling(window).corr(label_rank)
+    return pd.DataFrame({"ic_pearson_roll": roll_p, "ic_spearman_roll": roll_s})
+
+
+# ---- ADDED: daily IC series + stats (std, skew, t-test) ----
+def ic_series_by_day(test_df, label_col, pred_col):
+    d = test_df[[TIME_COL, label_col, pred_col]].dropna().copy()
+    d[TIME_COL] = pd.to_datetime(d[TIME_COL])
+    d["date"] = d[TIME_COL].dt.floor("1D")
+
+    ics = []
+    for dt, g in d.groupby("date"):
+        if len(g) < 3:
+            ics.append((dt, np.nan))
+        else:
+            ics.append((dt, g[pred_col].corr(g[label_col])))
+    return pd.Series({k: v for k, v in ics}).sort_index()
+
+
+def ic_stats(ic_s: pd.Series):
+    x = ic_s.dropna().values
+    n = len(x)
+    if n == 0:
+        return dict(n=0, mean=np.nan, std=np.nan, skew=np.nan, t=np.nan)
+
+    mean = x.mean()
+    std  = x.std(ddof=1) if n > 1 else np.nan
+    skew = pd.Series(x).skew()
+
+    if n > 1 and std > 1e-12:
+        t_stat = mean / (std / np.sqrt(n))
+    else:
+        t_stat = np.nan
+
+    return dict(n=n, mean=mean, std=std, skew=skew, t=t_stat)
+
+
+# ---- ADDED: time-series stratification on TEST ----
+def time_series_stratification(test_df, label_col, pred_col, n_bins=5):
+    d = test_df[[label_col, pred_col]].dropna().copy()
+    if len(d) == 0:
+        print(f"[Stratify][{pred_col}] no data")
+        return None
+
+    d["layer"] = pd.qcut(d[pred_col], n_bins, labels=False, duplicates="drop")
+    layer_mean = d.groupby("layer")[label_col].mean()
+
+    top = layer_mean.iloc[-1]
+    bot = layer_mean.iloc[0]
+    spread = top - bot
+
+    print(f"[Stratify][{pred_col}] mean fwd ret per layer:")
+    print(layer_mean)
+    print(f"[Stratify][{pred_col}] top-bottom spread = {spread:.6f}")
+    return layer_mean
+
+
+# ---- CHANGED: remove all plot code, add IC stats + stratification ----
+def ic_by_day(df, test_idx, preds, label_col, pred_name="pred", horizon_bars=288):
+    test_df = df.iloc[test_idx].copy()
+    test_df[pred_name] = preds
+
+    ic_p, ic_s = overall_ic(test_df, label_col, pred_name)
+    print(f"[IC][{pred_name}] Overall Pearson={ic_p:.6f}, Spearman={ic_s:.6f}")
+
+    ic_roll = rolling_ic(test_df, label_col, pred_name, window=horizon_bars)
+    mean_p = ic_roll["ic_pearson_roll"].mean()
+    mean_s = ic_roll["ic_spearman_roll"].mean()
+    last_p = ic_roll["ic_pearson_roll"].iloc[-1]
+    last_s = ic_roll["ic_spearman_roll"].iloc[-1]
+    print(f"[IC][{pred_name}] Rolling({horizon_bars}) mean Pearson={mean_p:.6f}, Spearman={mean_s:.6f}")
+    print(f"[IC][{pred_name}] Rolling({horizon_bars}) last Pearson={last_p:.6f}, Spearman={last_s:.6f}")
+
+    # daily IC stats
+    ic_day = ic_series_by_day(test_df, label_col, pred_name)
+    st = ic_stats(ic_day)
+    print(f"[IC][{pred_name}] Daily IC stats: n={st['n']}, mean={st['mean']:.6f}, "
+          f"std={st['std']:.6f}, skew={st['skew']:.6f}, t={st['t']:.3f}")
+
+    # time-series stratification
+    time_series_stratification(test_df, label_col, pred_name, n_bins=5)
+
+    return ic_roll, st
+
+
+def run_one_horizon(label_horizon_bars: int):
     # -------- Load --------
     df = pd.read_csv(INPUT_CSV, parse_dates=[TIME_COL])
     df = df.sort_values(TIME_COL).reset_index(drop=True)
+    print("\n==============================")
+    print(f"[GRID] LABEL_HORIZON_BARS = {label_horizon_bars}")
     print("[INFO] Loaded:", df.shape)
 
     # -------- Label --------
-    df, label_col = pick_or_create_label(df)
+    df, label_col = pick_or_create_label(df, label_horizon_bars, force_create=True)
 
     # -------- Features --------
     feature_cols = get_feature_cols(df, label_col)
@@ -272,16 +388,13 @@ def main():
 
     pred_mlp_val  = mlp.predict(Z_val).reshape(-1)
     pred_mlp_test = mlp.predict(Z_test).reshape(-1)
-
-    eval_regression(y_test, pred_mlp_test, "MLP")
+    rmse_mlp, mae_mlp, corr_mlp = eval_regression(y_test, pred_mlp_test, "MLP")
 
     # -------- XGB (optional) --------
     pred_xgb_val = pred_xgb_test = None
+    rmse_xgb = mae_xgb = corr_xgb = np.nan
     if xgb is not None:
         print("[INFO] Training XGB regressor...")
-
-        # New xgboost (>=2.1): early_stopping_rounds + eval_metric must be in constructor
-        # (fit() no longer accepts them). :contentReference[oaicite:2]{index=2}
         try:
             xgb_model = xgb.XGBRegressor(
                 **XGB_PARAMS,
@@ -294,7 +407,6 @@ def main():
                 verbose=200
             )
         except TypeError:
-            # Fallback for older xgboost if needed
             xgb_model = xgb.XGBRegressor(**XGB_PARAMS)
             xgb_model.fit(
                 Z_train, y_train,
@@ -304,7 +416,6 @@ def main():
                 verbose=200
             )
 
-        # Predict using best_iteration if present
         best_iter = getattr(xgb_model, "best_iteration", None)
         if best_iter is not None:
             pred_xgb_val  = xgb_model.predict(Z_val,  iteration_range=(0, best_iter + 1))
@@ -313,43 +424,57 @@ def main():
             pred_xgb_val  = xgb_model.predict(Z_val)
             pred_xgb_test = xgb_model.predict(Z_test)
 
-        eval_regression(y_test, pred_xgb_test, "XGB")
+        rmse_xgb, mae_xgb, corr_xgb = eval_regression(y_test, pred_xgb_test, "XGB")
 
     # -------- Blends --------
     pred_blend_avg_test = None
     pred_blend_stack_test = None
+    w = None
+    rmse_blend_avg = mae_blend_avg = corr_blend_avg = np.nan
+    rmse_blend_stack = mae_blend_stack = corr_blend_stack = np.nan
 
     if pred_xgb_test is not None:
-        # (A) simple avg
         pred_blend_avg_test = 0.5 * pred_mlp_test + 0.5 * pred_xgb_test
-        eval_regression(y_test, pred_blend_avg_test, "Blend-Avg")
+        rmse_blend_avg, mae_blend_avg, corr_blend_avg = eval_regression(y_test, pred_blend_avg_test, "Blend-Avg")
 
-        # (B) stacking weights learned on val
-        A = np.vstack([pred_mlp_val, pred_xgb_val]).T
-        w, *_ = np.linalg.lstsq(A, y_val, rcond=None)
-        print("[INFO] Stacking weights:", w)
+        w = learn_simplex_weights(pred_mlp_val, pred_xgb_val, y_val, alpha=STACK_RIDGE_ALPHA)
+        print("[INFO] Stacking weights (simplex, Ridge):", w)
 
         pred_blend_stack_test = w[0]*pred_mlp_test + w[1]*pred_xgb_test
-        eval_regression(y_test, pred_blend_stack_test, "Blend-Stack")
+        rmse_blend_stack, mae_blend_stack, corr_blend_stack = eval_regression(y_test, pred_blend_stack_test, "Blend-Stack")
+
+    # -------- IC tracking on TEST --------
+    test_idx = np.arange(val_end, len(df))
+
+    _, st_mlp = ic_by_day(df, test_idx, pred_mlp_test, label_col,
+                         pred_name="pred_mlp", horizon_bars=label_horizon_bars)
+    st_xgb = st_avg = st_stack = dict(n=0, mean=np.nan, std=np.nan, skew=np.nan, t=np.nan)
+
+    if pred_xgb_test is not None:
+        _, st_xgb = ic_by_day(df, test_idx, pred_xgb_test, label_col,
+                              pred_name="pred_xgb", horizon_bars=label_horizon_bars)
+        _, st_avg = ic_by_day(df, test_idx, pred_blend_avg_test, label_col,
+                              pred_name="pred_blend_avg", horizon_bars=label_horizon_bars)
+        _, st_stack = ic_by_day(df, test_idx, pred_blend_stack_test, label_col,
+                                pred_name="pred_blend_stack", horizon_bars=label_horizon_bars)
 
     # -------- Save predictions --------
-    # Create full-length prediction arrays aligned to df index
     pred_mlp_full = np.full(len(df), np.nan, dtype=np.float32)
+    pred_mlp_full[train_end:val_end] = pred_mlp_val
     pred_mlp_full[val_end:] = pred_mlp_test
 
     pred_xgb_full = np.full(len(df), np.nan, dtype=np.float32)
     if pred_xgb_test is not None:
+        pred_xgb_full[train_end:val_end] = pred_xgb_val
         pred_xgb_full[val_end:] = pred_xgb_test
 
     pred_blend_avg_full = np.full(len(df), np.nan, dtype=np.float32)
     pred_blend_stack_full = np.full(len(df), np.nan, dtype=np.float32)
-
     if pred_blend_avg_test is not None:
         pred_blend_avg_full[val_end:] = pred_blend_avg_test
     if pred_blend_stack_test is not None:
         pred_blend_stack_full[val_end:] = pred_blend_stack_test
 
-    # Use concat to avoid fragmentation
     preds_df = pd.DataFrame({
         "pred_mlp": pred_mlp_full,
         "pred_xgb": pred_xgb_full,
@@ -358,11 +483,49 @@ def main():
     }, index=df.index)
 
     out = pd.concat([df, preds_df], axis=1)
-    out.to_csv(OUTPUT_CSV, index=False)
-    print("[INFO] Saved:", OUTPUT_CSV)
+
+    out_csv = OUTPUT_CSV.replace(".csv", f"_h{label_horizon_bars}.csv")
+    out.to_csv(out_csv, index=False)
+    print("[INFO] Saved:", out_csv)
+
+    # -------- Return summary for grid --------
+    summary = {
+        "horizon_bars": label_horizon_bars,
+
+        "rmse_mlp": rmse_mlp, "mae_mlp": mae_mlp, "corr_mlp": corr_mlp,
+        "ic_mean_mlp": st_mlp["mean"], "ic_std_mlp": st_mlp["std"],
+        "ic_skew_mlp": st_mlp["skew"], "ic_t_mlp": st_mlp["t"], "ic_n_mlp": st_mlp["n"],
+
+        "rmse_xgb": rmse_xgb, "mae_xgb": mae_xgb, "corr_xgb": corr_xgb,
+        "ic_mean_xgb": st_xgb["mean"], "ic_std_xgb": st_xgb["std"],
+        "ic_skew_xgb": st_xgb["skew"], "ic_t_xgb": st_xgb["t"], "ic_n_xgb": st_xgb["n"],
+
+        "rmse_blend_avg": rmse_blend_avg, "mae_blend_avg": mae_blend_avg, "corr_blend_avg": corr_blend_avg,
+        "ic_mean_blend_avg": st_avg["mean"], "ic_std_blend_avg": st_avg["std"],
+        "ic_skew_blend_avg": st_avg["skew"], "ic_t_blend_avg": st_avg["t"], "ic_n_blend_avg": st_avg["n"],
+
+        "rmse_blend_stack": rmse_blend_stack, "mae_blend_stack": mae_blend_stack, "corr_blend_stack": corr_blend_stack,
+        "ic_mean_blend_stack": st_stack["mean"], "ic_std_blend_stack": st_stack["std"],
+        "ic_skew_blend_stack": st_stack["skew"], "ic_t_blend_stack": st_stack["t"], "ic_n_blend_stack": st_stack["n"],
+    }
+    return summary
+
+
+def main():
+    results = []
+    for h in LABEL_HORIZON_LIST:
+        results.append(run_one_horizon(h))
+
+    res_df = pd.DataFrame(results).sort_values("horizon_bars")
+    grid_csv = OUTPUT_CSV.replace(".csv", "_grid_results.csv")
+    res_df.to_csv(grid_csv, index=False)
+    print("\n==============================")
+    print("[GRID] Finished. Results saved ->", grid_csv)
+    print(res_df)
 
 
 if __name__ == "__main__":
     main()
+
 
 
